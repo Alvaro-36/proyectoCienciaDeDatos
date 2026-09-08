@@ -6,3 +6,7 @@ logs/
 .venv
 airflow.db
 airflow.cfg
+
+include/output/
+.pytest_cache/
+__pycache__/

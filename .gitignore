@@ -16,3 +16,10 @@ airflow.db
 
 **/.astro/dbt_metadata.json
 **/.astro/manifest.slim.json
+
+# Datos, credenciales y caches locales del pipeline
+.env.*
+!.env.example
+include/output/
+.pytest_cache/
+*.pyc

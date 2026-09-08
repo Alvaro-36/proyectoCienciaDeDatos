@@ -1,1 +1,4 @@
-# Astro Runtime includes the following pre-installed providers packages: https://www.astronomer.io/docs/astro/runtime-image-architecture#provider-packages
+# Airflow y standard provider ya vienen con Astro Runtime (Dockerfile).
+pandas>=2.2,<3.0
+requests>=2.32,<3.0
+python-dotenv>=1.0,<2.0
