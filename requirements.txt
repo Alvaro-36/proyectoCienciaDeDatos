@@ -1,4 +1,6 @@
-# Airflow y standard provider ya vienen con Astro Runtime (Dockerfile).
-pandas>=2.2,<3.0
-requests>=2.32,<3.0
-python-dotenv>=1.0,<2.0
+beautifulsoup4>=4.13
+lxml>=6.0
+pandas>=2.2
+playwright>=1.55
+apache-airflow-providers-http>=6.0
+yfinance>=1.7
