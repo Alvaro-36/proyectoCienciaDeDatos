@@ -71,13 +71,16 @@ FUNDAMENTALES = {
                  'Net Income From Continuing Operations': 'net_income'},
     'income': {'Total Revenue': 'total_revenue'},
 }
+# Un evento sin estados contables completos no sirve para el análisis: se descarta
+# la fila entera en vez de arrastrar nulos hasta la plata.
+FUNDAMENTALES_REQUERIDOS = ('total_assets', 'short_long_term_debt_total',
+                            'total_current_assets', 'total_current_liabilities',
+                            'operating_cashflow', 'capital_expenditures',
+                            'dividend_payout', 'net_income', 'total_revenue')
 CAUSAS_NULOS = {
     **{c: 'Cobertura de la fuente o campo no informado; no se imputa.' for c in COLUMNAS_EVENTOS},
     **{c: 'Yahoo publica sólo 5-7 trimestres de estados contables; los eventos más '
-          'viejos no tienen fundamental asociado.' for c in
-       ('total_assets', 'short_long_term_debt_total', 'total_current_assets',
-        'total_current_liabilities', 'operating_cashflow', 'capital_expenditures',
-        'dividend_payout', 'net_income', 'total_revenue')},
+          'viejos no tienen fundamental asociado.' for c in FUNDAMENTALES_REQUERIDOS},
     'dividend_payout': 'Puede indicar ausencia de dividendos o falta de cobertura; no se asume cero sin verificar.',
     'total_current_assets': 'Faltante estructural en financieras (JPM no abre corriente/no corriente) o falta de cobertura.',
     'total_current_liabilities': 'Faltante estructural en financieras o falta de cobertura.',
@@ -414,6 +417,19 @@ def parse_fundamentales(ticker, payload):
     return result
 
 
+def rueda_coherente(fila):
+    """Las mismas reglas que exige validar(): precio positivo, volumen >= 0 y OHLC
+    consistente. Yahoo publica ruedas rotas sueltas -HUBB trae una vacía de 1977 y
+    una de 2021 con low > open-, así que se descartan acá en vez de romper la
+    corrida entera. El bronze las conserva: el descarte es auditable.
+    """
+    o, h, l, c = (fila[k] for k in ('open', 'high', 'low', 'close'))
+    v, a = fila['volume'], fila['close_adj']
+    if any(x is None for x in (o, h, l, c, v, a)):
+        return False
+    return min(o, h, l, c, a) > 0 and v >= 0 and l <= min(o, c, h) and h >= max(o, c, l)
+
+
 def parse_precios(ticker, payload, snapshot):
     """OHLC ya viene ajustado por splits desde Yahoo; close_adj suma dividendos.
 
@@ -431,16 +447,23 @@ def parse_precios(ticker, payload, snapshot):
     if rows and not fecha(snapshot):
         raise ValueError(f'Snapshot inválido para los precios de {ticker}.')
     result = []
+    descartadas = 0
     for r in rows:
         d = fecha(r.get('date'))
         if not d:
             raise ValueError(f'Fecha de precio inválida para {ticker}.')
         if d >= snapshot:
             continue
-        result.append({'ticker': ticker, 'date': d, 'open': num(r.get('open')),
-                       'high': num(r.get('high')), 'low': num(r.get('low')),
-                       'close': num(r.get('close')), 'volume': num(r.get('volume')),
-                       'close_adj': num(r.get('close_adj'))})
+        fila = {'ticker': ticker, 'date': d, 'open': num(r.get('open')),
+                'high': num(r.get('high')), 'low': num(r.get('low')),
+                'close': num(r.get('close')), 'volume': num(r.get('volume')),
+                'close_adj': num(r.get('close_adj'))}
+        if not rueda_coherente(fila):
+            descartadas += 1
+            continue
+        result.append(fila)
+    if descartadas:
+        log.warning('PRECIOS_INCOHERENTES ticker=%s ruedas_descartadas=%s', ticker, descartadas)
     return result
 
 
@@ -573,6 +596,10 @@ def refinar_plata(mode='fullset'):
             events.append(event)
     ev = pd.DataFrame(events, columns=COLUMNAS_EVENTOS)
     ev = ev.drop_duplicates(['ticker', 'fiscal_quarter_end'], keep='first')
+    antes = len(ev)
+    ev = ev.dropna(subset=list(FUNDAMENTALES_REQUERIDOS)).copy()
+    log.info('FILTRO_FUNDAMENTALES antes=%s despues=%s descartados=%s tickers=%s',
+             antes, len(ev), antes - len(ev), ev.ticker.nunique())
     zero_fraction = float(ev['surprise'].eq(0).mean()) if len(ev) else 0
     log.info('SORPRESA_CERO proporcion=%.6f umbral=0.03', zero_fraction)
     if zero_fraction > 0.03:
@@ -666,6 +693,8 @@ def validar(paths, mode='fullset'):
         numeric = pd.to_numeric(ev[c], errors='coerce')
         if (ev[c].notna() & numeric.isna()).any() or numeric.dropna().isin([float('inf'), float('-inf')]).any():
             problemas.append(f'valor numérico inválido: {c}')
+    if ev[list(FUNDAMENTALES_REQUERIDOS)].isna().any().any():
+        problemas.append('hay filas con fundamentales nulos')
     if ev[['reported_eps', 'consensus_eps']].isna().any().any():
         problemas.append('EPS reportado/consenso nulo')
     if pd.to_numeric(ev.consensus_eps, errors='coerce').abs().lt(0.05).any():

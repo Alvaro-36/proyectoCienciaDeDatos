@@ -450,3 +450,16 @@ def test_cli_pending_data_exits_cleanly_without_silver(monkeypatch):
         m.main()
     assert exc.value.code == 2
     assert not m.PLATA.exists()
+
+
+def test_rueda_coherente_descarta_las_filas_rotas_de_yahoo():
+    """Las dos ruedas reales de HUBB que voltearon la validación del 2026-09-22."""
+    base = {'open': 10.0, 'high': 11.0, 'low': 9.0, 'close': 10.5,
+            'volume': 100.0, 'close_adj': 10.5}
+    assert m.rueda_coherente(base)
+    vacia = {**base, 'open': None, 'high': None, 'low': None, 'close': None, 'close_adj': None}
+    assert not m.rueda_coherente(vacia)                     # HUBB 1977-08-08
+    assert not m.rueda_coherente({**base, 'low': 10.2})     # HUBB 2021-05-05: low > open
+    assert not m.rueda_coherente({**base, 'high': 10.4})    # high < close
+    assert not m.rueda_coherente({**base, 'close_adj': 0.0})
+    assert not m.rueda_coherente({**base, 'volume': -1.0})
