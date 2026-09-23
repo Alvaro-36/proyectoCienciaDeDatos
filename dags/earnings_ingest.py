@@ -1,8 +1,10 @@
-"""Yahoo Finance -> bronze inmutable -> plata validada.
+"""Yahoo Finance + SEC EDGAR (XBRL) -> bronze inmutable -> plata validada.
 
 Los helpers se pueden importar sin Airflow y sin yfinance: la fuente se importa
 recién dentro de la descarga, así los parsers quedan testeables en frío.
-No hay API key ni cuota diaria; el límite es throttling por IP.
+No hay API key ni cuota diaria; el límite es throttling por IP (Yahoo) y por
+User-Agent (SEC EDGAR, 10 req/s). Yahoo sólo publica 5-7 trimestres de estados
+contables; EDGAR aporta la historia trimestral (10-Q/10-K) desde ~2009.
 Consultar README.md para configuración, límites y trazabilidad.
 """
 from __future__ import annotations
@@ -32,10 +34,13 @@ OUTPUT_DIR = PROJECT_DIR / 'include' / 'output'
 BRONZE = OUTPUT_DIR / 'bronze'
 PLATA = OUTPUT_DIR / 'silver'
 UNIVERSO = PROJECT_DIR / 'include' / 'universo' / 'universo.csv'
+CIK_INDEX = PROJECT_DIR / 'include' / 'universo' / 'cik.json'
 BENCHMARK = 'SPY'
 EXCLUIDOS = frozenset({'CMA'})  # ponytail: se filtra acá y no en el CSV, que lo regenera la cátedra.
-ENDPOINTS = ('EARNINGS', 'PERFIL', 'FUNDAMENTALES', 'PRECIOS')
-TTL = dict(zip(ENDPOINTS, (7, 30, 30, 1)))
+ENDPOINTS = ('EARNINGS', 'PERFIL', 'FUNDAMENTALES', 'EDGAR', 'PRECIOS')
+# EDGAR se refresca cada 30 días: los hechos de un trimestre quedan cerrados
+# salvo restatements (10-K/A, 10-Q/A) que conviene recoger.
+TTL = dict(zip(ENDPOINTS, (7, 30, 30, 30, 1)))
 # Yahoo publica dos registros contradictorios para un mismo anuncio en su tramo
 # más viejo: medido, 14 de 63 tickers, y todos salvo uno son de 2002. Se corta la
 # época entera en vez de arbitrar par por par (cuesta el 3,7% de los eventos).
@@ -77,6 +82,30 @@ FUNDAMENTALES_REQUERIDOS = ('total_assets', 'short_long_term_debt_total',
                             'total_current_assets', 'total_current_liabilities',
                             'operating_cashflow', 'capital_expenditures',
                             'dividend_payout', 'net_income', 'total_revenue')
+# --- SEC EDGAR (XBRL) ---------------------------------------------------------
+# Yahoo sólo publica 5-7 trimestres de estados contables; EDGAR cubre los 10-Q y
+# 10-K desde la era XBRL (~2009). Los tags us-gaap migran con los años (ASC 606,
+# re-expresiones), por eso cada columna tiene una lista de prioridad y por cada
+# periodo manda el hecho con filing más reciente.
+FORMAS_EDGAR = ('10-Q', '10-K')
+TAGS_EDGAR = {
+    'total_assets': ('instant', ('Assets', 'AssetsTotal')),
+    'short_long_term_debt_total': ('instant', ('DebtLongtermAndShorttermCombinedAmount', 'LongTermDebtNoncurrent')),
+    'total_current_assets': ('instant', ('AssetsCurrent',)),
+    'total_current_liabilities': ('instant', ('LiabilitiesCurrent',)),
+    'operating_cashflow': ('duration', ('NetCashProvidedByUsedInOperatingActivities',)),
+    'capital_expenditures': ('duration', ('PaymentsToAcquirePropertyPlantAndEquipment',)),
+    'dividend_payout': ('duration', ('PaymentsOfDividends', 'PaymentsOfDividendsCommonStock')),
+    'net_income': ('duration', ('NetIncomeLoss',)),
+    'total_revenue': ('duration', ('Revenues', 'RevenueFromContractWithCustomerExcludingAssessedTax', 'SalesRevenueNet')),
+}
+# No todas las empresas lo reportan en los 10-Q (AAPL no lo declara); cuando
+# falta, shares_outstanding queda con el valor actual de PERFIL.
+TAGS_ACCIONES_EDGAR = ('EntityCommonStockSharesOutstanding', 'CommonStockSharesOutstanding')
+# SEC pide un User-Agent identificable (10 req/s sin clave). Configurable por env.
+SEC_USER_AGENT = os.environ.get(
+    'SEC_USER_AGENT',
+    'UTN-FRM-CienciaDatos/1.0 (proyecto integrador; definir SEC_USER_AGENT con el contacto de la cátedra)')
 CAUSAS_NULOS = {
     **{c: 'Cobertura de la fuente o campo no informado; no se imputa.' for c in COLUMNAS_EVENTOS},
     **{c: 'Yahoo publica sólo 5-7 trimestres de estados contables; los eventos más '
@@ -177,7 +206,140 @@ def yf_get(funcion, ticker):
                           'low': num(r.Low), 'close': num(r.Close), 'volume': num(r.Volume),
                           'close_adj': num(r['Adj Close']), 'split': num(r['Stock Splits'])}
                          for i, r in h.iterrows()]}
+    if funcion == 'EDGAR':
+        return edgar_get(ticker)
     raise ValueError(f'Endpoint desconocido: {funcion}.')
+
+
+_CIK_CACHE = None
+
+
+def leer_cik():
+    """Mapa ticker -> CIK de 10 dígitos. Seed versionada (cik.json), sin red."""
+    global _CIK_CACHE
+    if _CIK_CACHE is None:
+        _CIK_CACHE = json.loads(CIK_INDEX.read_text(encoding='utf-8'))['tickers']
+    return _CIK_CACHE
+
+
+def fin_mes(value):
+    """Cierre de mes del periodo EDGAR (fiscal 52/53 semanas -> mes calendario)."""
+    try:
+        return (pd.Timestamp(value).normalize() + MonthEnd(0)).date().isoformat()
+    except (ValueError, TypeError):
+        return None
+
+
+def hechos_por_etiqueta(facts, tags):
+    """Hechos 10-Q/10-K de las etiquetas us-gaap dadas, deduplicados por clave.
+
+    Clave 'end' para hechos instantáneos; 'start|end' para duraciones (YTD
+    acumulado dentro del año fiscal). Ante restatements prevalece el hecho con
+    filing más reciente, y ante migración de tag (ASC 606) el de mayor prioridad.
+    """
+    out = {}
+    for tag in tags:
+        bloque = (facts or {}).get(tag)
+        if not bloque:
+            continue
+        unidades = bloque.get('units') or {}
+        # La unidad con más hechos es la del periodo estándar (USD o shares).
+        if not unidades:
+            continue
+        unidad = max(unidades, key=lambda u: len(unidades[u]))
+        for hecho in unidades[unidad]:
+            if not str(hecho.get('form') or '').startswith(FORMAS_EDGAR):
+                continue
+            valor = num(hecho.get('val'))
+            end = str(hecho.get('end') or '')
+            if valor is None or not fecha(end[:10]):
+                continue
+            start = str(hecho.get('start') or '')
+            clave = f'{start}|{end}' if start else end
+            prev = out.get(clave)
+            if prev is None or str(hecho.get('filed') or '') > prev['filed']:
+                out[clave] = {'valor': valor, 'tag': tag, 'form': str(hecho.get('form')),
+                              'filed': str(hecho.get('filed') or ''), 'start': start or None, 'end': end[:10]}
+    return out
+
+
+def valores_por_periodo(hechos, tipo):
+    """{fiscal_quarter_end: hecho} con la regla del tipo de hecho.
+
+    instant: el hecho de cierre de periodo (fin de mes, último filed gana).
+    duration: los 10-Q/10-K declaran acumulado YTD dentro del año fiscal, así
+    que se resta el trimestre anterior de la misma cadena para dejar el valor
+    trimestral. Un hueco > 120 días entre periodos no fabrica trimestre.
+    """
+    resultado = {}
+    if tipo == 'instant':
+        for clave, hecho in hechos.items():
+            fq = fin_mes(hecho['end'])
+            if not fq:
+                continue
+            if fq not in resultado or hecho['filed'] > resultado[fq]['filed']:
+                resultado[fq] = dict(hecho)
+        return resultado
+    por_fy = {}
+    for hecho in hechos.values():
+        por_fy.setdefault(hecho.get('start'), []).append(hecho)
+    for cadena in por_fy.values():
+        cadena.sort(key=lambda h: h['end'])
+        anterior = None
+        for hecho in cadena:
+            fq = fin_mes(hecho['end'])
+            if not fq:
+                continue
+            if anterior is not None and hecho['end'] != anterior['end']:
+                dias = (pd.Timestamp(hecho['end']) - pd.Timestamp(anterior['end'])).days
+                if 0 < dias <= 120:
+                    q = dict(hecho)
+                    q['valor'] = hecho['valor'] - anterior['valor']
+                    resultado[fq] = q
+            elif anterior is None:
+                resultado[fq] = dict(hecho)
+            anterior = hecho
+    return resultado
+
+
+def parse_edgar_full(ticker, cik, us_gaap):
+    """Payload bronze de EDGAR: {cik, periodos, fechas, fuentes}. None si vacío."""
+    periodos, fuentes = {}, {}
+    for col, (tipo, tags) in TAGS_EDGAR.items():
+        for fq, hecho in valores_por_periodo(hechos_por_etiqueta(us_gaap, tags), tipo).items():
+            periodos.setdefault(fq, {})[col] = hecho['valor']
+            fuentes.setdefault(fq, {})[col] = {k: hecho.get(k) for k in ('tag', 'form', 'filed')}
+    for fq, hecho in valores_por_periodo(hechos_por_etiqueta(us_gaap, TAGS_ACCIONES_EDGAR), 'instant').items():
+        periodos.setdefault(fq, {})['shares_outstanding'] = hecho['valor']
+        fuentes.setdefault(fq, {})['shares_outstanding'] = {k: hecho.get(k) for k in ('tag', 'form', 'filed')}
+    if not periodos:
+        return None
+    fechas = sorted(periodos)
+    return {'cik': cik, 'periodos': periodos,
+            'fechas': {'min': fechas[0], 'max': fechas[-1]}, 'fuentes': fuentes}
+
+
+def edgar_get(ticker):
+    """Descarga companyfacts de SEC EDGAR y lo reduce al payload bronze.
+
+    Sin CIK en el índice -> None (rechazo silencioso, no error de transporte):
+    quedan pendientes para revisar los logs. Errores HTTP/red sí son transitorios.
+    """
+    cik = leer_cik().get(ticker)
+    if not cik:
+        log.warning('EDGAR_SIN_CIK ticker=%s', ticker)
+        return None
+    import gzip
+    import urllib.request
+    url = f'https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json'
+    request = urllib.request.Request(url, headers={'User-Agent': SEC_USER_AGENT,
+                                                   'Accept-Encoding': 'gzip, deflate'})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        raw = response.read()
+        if (response.headers.get('Content-Encoding') or '').lower() == 'gzip':
+            raw = gzip.decompress(raw)
+        data = json.loads(raw.decode('utf-8'))
+    return parse_edgar_full(ticker, cik, (data.get('facts') or {}).get('us-gaap') or {})
 
 
 def es_util(funcion, payload):
@@ -187,6 +349,8 @@ def es_util(funcion, payload):
         return any(texto(payload.get(k)) for k in ('sector', 'industry', 'exchange'))
     if funcion == 'FUNDAMENTALES':
         return any(isinstance(v, dict) and v for v in payload.values())
+    if funcion == 'EDGAR':
+        return bool(payload.get('periodos'))
     rows = payload.get('rows')
     return isinstance(rows, list) and bool(rows) and all(isinstance(r, dict) for r in rows)
 
@@ -267,6 +431,9 @@ def armar_lotes(items, workers=8):
 def resumen_payload(funcion, payload):
     if funcion == 'PERFIL':
         return {'records': 1, 'fields': sorted(k for k, v in payload.items() if v is not None)}
+    if funcion == 'EDGAR':
+        return {**payload.get('fechas', {}), 'records': len(payload.get('periodos') or {}),
+                'cik': payload.get('cik')}
     if funcion == 'FUNDAMENTALES':
         dates = sorted({d for tabla in payload.values() for d in tabla})
         return {'records': len(dates), 'date_min': dates[0] if dates else None,
@@ -415,6 +582,11 @@ def parse_fundamentales(ticker, payload):
             result.setdefault(fq, {}).update({target: num(row.get(source))
                                               for source, target in mapping.items()})
     return result
+
+
+def parse_edgar(ticker, payload):
+    """Igual shape que parse_fundamentales: {fiscal_quarter_end: {col: valor}}."""
+    return (payload or {}).get('periodos') or {}
 
 
 def rueda_coherente(fila):
@@ -585,13 +757,19 @@ def refinar_plata(mode='fullset'):
         fundamentals_raw = leer_ultimo('FUNDAMENTALES', ticker)
         data = parse_eventos(ticker, leer_ultimo('EARNINGS', ticker), fase_fiscal(fundamentals_raw))
         fundamentals = parse_fundamentales(ticker, fundamentals_raw)
+        edgar = parse_edgar(ticker, leer_ultimo('EDGAR', ticker))
+        # Yahoo gana donde hay datos; EDGAR llena los trimestres históricos que
+        # Yahoo no publica (sólo 5-7 trimestres).
+        fundamentals = {**edgar, **fundamentals}
         perfil = leer_ultimo('PERFIL', ticker) or {}
         lineage[ticker] = {ep: ultimo_snapshot(ep, ticker) for ep in ENDPOINTS}
         for event in data:
             event.update(fundamentals.get(event['fiscal_quarter_end'], {}))
             event.update({target: texto(perfil.get(source)) for source, target in PERFIL.items()
                           if target != 'shares_outstanding'})
-            event['shares_outstanding'] = num(perfil.get('sharesOutstanding'))
+            # EDGAR aporta acciones del trimestre cuando el tag existe; si no,
+            # queda el valor actual de PERFIL (sin imputar historia).
+            event.setdefault('shares_outstanding', num(perfil.get('sharesOutstanding')))
             event['snapshot_date'] = ultimo_snapshot('EARNINGS', ticker)
             events.append(event)
     ev = pd.DataFrame(events, columns=COLUMNAS_EVENTOS)

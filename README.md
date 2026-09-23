@@ -1,4 +1,4 @@
-# Reacción a resultados — Alpha Vantage / Airflow
+# Reacción a resultados — Yahoo Finance + SEC EDGAR / Airflow
 
 Pipeline del Proyecto Integrador de Ciencia de Datos (UTN FRM). Guarda respuestas
 originales en bronze y produce eventos trimestrales, precios y calendario en plata.
@@ -11,33 +11,34 @@ El proyecto conserva Astro Runtime `3.3-7` del Dockerfile original. Requiere Doc
 y Astro CLI para ejecutar Airflow. Para la CLI sin Airflow, usar Python 3.12+ y
 `pip install -r requirements.txt` dentro de un entorno virtual.
 
-1. Completar el archivo `.env` creado en la raíz con claves propias:
+1. Completar el archivo `.env` creado en la raíz (guía en `.env.example`). No
+   hace falta clave ni API key; sólo definir `SEC_USER_AGENT` con un contacto
+   real para cumplir la política de SEC EDGAR:
 
    ```dotenv
-   ALPHAVANTAGE_API_KEYS=["primera_clave","segunda_clave","tercera_clave"]
-   AV_MIN_REQUEST_INTERVAL_SECONDS=1.1
-   AV_RATE_COOLDOWN_SECONDS=65
-   AV_DAILY_COOLDOWN_SECONDS=86400
+   SEC_USER_AGENT="UTN-FRM-CienciaDatos/1.0 (contacto: estudiante@example.com)"
    ```
 
-   El array vacío inicial evita utilizar credenciales inventadas. `.env`, los
-   datos y los logs están excluidos de Git. `.env.example` sí se versiona.
-   Astro carga `.env`; la CLI también lo carga sin reemplazar variables de entorno.
+   El bloque `ALPHAVANTAGE_API_KEYS` de `.env.example` es legado de la versión
+   original del pipeline y el código actual no lo lee. `.env`, los datos y los
+   logs están excluidos de Git. `.env.example` sí se versiona. Astro carga
+   `.env`; la CLI también lo carga sin reemplazar variables de entorno.
 
 2. Desde esta carpeta ejecutar `astro dev start`. Abrir la dirección de Airflow
    que muestra Astro, habilitar `earnings_ingest` y disparar una prueba con:
 
    ```json
-   {"mode":"subset","force":false,"solo_plata":false,"outputsize":"compact","incluir_consenso":false}
+   {"mode":"subset","force":false,"solo_plata":false}
    ```
 
-   `subset` usa únicamente NVIDIA (`NVDA`) y SPY como benchmark. Es el modo predeterminado. No se presenta como entrega
-   académica: publica en `prueba_subset_<fecha>/` y exige al menos un evento.
+   `subset` usa únicamente NVIDIA (`NVDA`) y SPY como benchmark. Es el modo
+   predeterminado. No se presenta como entrega académica: publica en
+   `prueba_subset_<fecha>/` y exige al menos un evento.
 
-3. Para cargar el universo completo usar `mode="full"`. Mantener `compact` con
-   claves gratuitas; `outputsize="full"` requiere acceso premium. La prueba usa
-   `compact` como valor predeterminado tanto en Airflow como en la CLI.
-   Una respuesta de falta de permisos no se guarda ni se considera cuota agotada.
+3. Para cargar el universo completo usar `mode="fullset"` (los 906 símbolos de la
+   semilla). No hay claves ni `outputsize`: las fuentes son gratuitas
+   (Yahoo Finance + SEC EDGAR). Respuestas no válidas no se guardan y quedan
+   pendientes para revisión en los logs.
 
 4. Habilitado en Airflow, corre diariamente (`@daily`, UTC, sin catchup). Revisar
    los logs y `include/output/silver/validacion.json`. No se publica una entrega
@@ -55,19 +56,16 @@ Todos estos comandos se ejecutan desde la raíz del proyecto:
 
 ```sh
 # Planifica sin requests ni escritura de datos.
-python dags/earnings_ingest.py --plan --mode full --outputsize compact
+python dags/earnings_ingest.py --plan --mode fullset
 
 # Prueba de ingesta y refinamiento.
-python dags/earnings_ingest.py --mode subset --outputsize compact
+python dags/earnings_ingest.py --mode subset
 
-# Reprocesa exclusivamente archivos locales: no necesita claves ni red.
+# Reprocesa exclusivamente archivos locales: no necesita red.
 python dags/earnings_ingest.py --solo-plata --mode subset
 
 # Validación de entrega completa: más de 1.000 eventos.
-python dags/earnings_ingest.py --solo-plata --mode full
-
-# Incorporar las cuatro columnas de consenso cuando haya capturas previas.
-python dags/earnings_ingest.py --solo-plata --mode full --incluir-consenso
+python dags/earnings_ingest.py --solo-plata --mode fullset
 ```
 
 En Airflow usar `solo_plata=true` para el mismo reprocesamiento. No ejecutar la CLI
@@ -76,30 +74,24 @@ con `max_active_runs=1`, la CLI con su propio lock, pero no comparten una
 transacción de refinamiento. Los workers deben compartir el mismo volumen local;
 los locks de archivo no sustituyen una coordinación distribuida sobre S3.
 
-## Rotación de claves
+## Límites de las fuentes
 
-- Se intenta la clave activa hasta recibir HTTP 429 o un mensaje de cuota en
-  `Information`, `Note` o `Error Message`, incluso con HTTP 200.
-- Se registra un enfriamiento y se reintenta **la misma descarga** con la próxima
-  clave disponible del array. Cada clave se prueba como máximo una vez por llamada.
-- `Retry-After` tiene prioridad cuando está presente. Sin él se usan 65 segundos
-  para límites breves y 86.400 para límites diarios, ambos configurables. El
-  enfriamiento diario es conservador desde la respuesta: no supone una hora de
-  reinicio del proveedor. Se debe adaptar a la cuota contratada.
-- La posición activa, el último uso y los enfriamientos se guardan en
-  `include/output/state/api_keys.json` bajo lock; sobreviven a lotes, reintentos y
-  reinicios. El estado guarda hashes de claves, no sus valores.
-- Si todas están limitadas, se corta el lote sin espera infinita. Los archivos
-  faltantes siguen pendientes. Se puede refinar el bronze acumulado; la
-  validación decide si alcanza para publicar.
-- Errores de conexión/servidor permiten reintentos de Airflow. Los archivos ya
-  obtenidos no se descargan otra vez. Errores de permisos, símbolo o esquema no
-  se almacenan; el log indica que la respuesta fue rechazada.
-- Para no consumir toda una cuota pequeña refrescando las primeras empresas,
-  las descargas sin snapshot tienen prioridad; luego se actualiza lo más antiguo.
+El pipeline actual no usa claves: Yahoo Finance limita por IP y SEC EDGAR por
+User-Agent (10 req/s, sin autenticación). Pautas implementadas:
 
-No se asigna una cuota hipotética por anticipado: la rotación responde al límite
-que devuelve la API. Usar sólo claves propias con acceso habilitado a los endpoints.
+- Cada descarga respeta un ritmo global y los errores de conexión/servidor
+  permiten reintentos de Airflow. Los archivos ya obtenidos no se descargan otra
+  vez.
+- Respuestas no válidas (símbolo desconocido, esquema, sin CIK en `cik.json`) no
+  se almacenan y quedan pendientes; el log indica el rechazo (BRONCE_RECHAZADO,
+  EDGAR_SIN_CIK).
+- Para no refrescar siempre las primeras empresas, las descargas sin snapshot
+  tienen prioridad; luego se actualiza lo más antiguo.
+- SEC EDGAR es un servicio público: usar un `SEC_USER_AGENT` identificable con
+  contacto real y no exceder ~10 req/s agregados.
+
+La sección "Rotación de claves" de versiones anteriores (Alpha Vantage) quedó
+obsoleta: el código actual no rota claves ni escribe `state/api_keys.json`.
 
 ## Bronze y logs de lo obtenido
 
@@ -108,9 +100,12 @@ include/
   universo/universo.csv
   output/
     bronze/EARNINGS/ticker=IBM/snapshot=2026-09-08.json
-    bronze/TIME_SERIES_DAILY/ticker=IBM/snapshot=2026-09-08.json
+    bronze/FUNDAMENTALES/ticker=IBM/snapshot=2026-09-08.json
+    bronze/EDGAR/ticker=IBM/snapshot=2026-09-08.json
+    bronze/PERFIL/ticker=IBM/snapshot=2026-09-08.json
+    bronze/PRECIOS/ticker=IBM/snapshot=2026-09-08.json
     logs/bronze.jsonl
-    state/api_keys.json
+    state/ingesta_full.json
     silver/
       slv_eventos.csv
       slv_precios.csv
@@ -123,17 +118,20 @@ include/
 Cada descarga válida genera un mensaje `BRONZE_OBTENIDO` en el log de ejecución
 y una línea JSON persistente en `logs/bronze.jsonl`: endpoint, ticker, fecha UTC de
 obtención, snapshot, ruta, bytes, SHA-256, cantidad de registros y rango de fechas
-(o campos recibidos para OVERVIEW). Ejemplo ilustrativo del formato:
+(o campos recibidos para PERFIL y EDGAR). Ejemplo ilustrativo del formato:
 
 ```json
 {"event":"bronze_obtenido","endpoint":"EARNINGS","ticker":"IBM","snapshot":"2026-09-08","records":100,"date_min":"2001-06-30","date_max":"2026-03-31","path":".../snapshot=2026-09-08.json"}
 ```
 
-La cantidad corresponde al bloque que se usará en plata (`quarterlyEarnings`,
-`quarterlyReports`, `estimates`, `data` o serie diaria). El JSON completo de la
-fuente se conserva exactamente como llegó, incluidos bloques anuales no usados.
-Los logs y XCom no contienen payloads completos ni claves. Un archivo existente
-no se vuelve a registrar como una descarga nueva.
+La cantidad corresponde a lo que se usará en plata: filas de resultados
+(EARNINGS), periodos contables (FUNDAMENTALES y EDGAR) o ruedas de precios
+(PRECIOS). El JSON completo de Yahoo se conserva exactamente como llegó,
+incluidos bloques anuales no usados. Para EDGAR, bronze guarda los hechos
+10-Q/10-K utilizados (cada valor con tag, form y fecha de filing en `fuentes`),
+no el companyfacts completo de la SEC: auditables y livianos. Los logs y XCom no
+contienen payloads completos ni claves. Un archivo existente no se vuelve a
+registrar como una descarga nueva.
 
 La escritura usa archivo temporal y reemplazo atómico bajo lock. Bronze es
 inmutable: `force=true` ignora TTL, pero **no sobrescribe el snapshot del mismo
@@ -141,10 +139,11 @@ día**. Una segunda corrida el mismo día, con todos los ítems completos, no ha
 requests, ni siquiera al sensor. Si se cambia de `compact` a `full` el mismo día,
 la captura existente se conserva; usar la próxima fecha de captura.
 
-TTL en días: EARNINGS y estados contables 80; SPLITS 90; OVERVIEW 30;
-EARNINGS_ESTIMATES y TIME_SERIES_DAILY 1. La fecha del snapshot es la fecha real de
-captura UTC. La fecha de entrega sale de `logical_date` o `run_after` para admitir
-corridas manuales sin intervalo.
+TTL en días: EARNINGS 7; PERFIL 30; FUNDAMENTALES 30; EDGAR 30; PRECIOS 1. EDGAR
+se refresca mensualmente: los hechos de un trimestre quedan cerrados salvo
+restatements (10-K/A, 10-Q/A) que conviene recoger. La fecha del snapshot es la
+fecha real de captura UTC. La fecha de entrega sale de `logical_date` o
+`run_after` para admitir corridas manuales sin intervalo.
 
 ## Plata y decisiones del plan
 
@@ -160,8 +159,11 @@ corridas manuales sin intervalo.
 - Los tres estados contables se unen por cierre fiscal. Se guardan niveles y el
   signo original de capex. No se imputan dividendos nulos automáticamente: pueden
   representar ausencia de pago o falta de cobertura.
-- OVERVIEW aporta la clasificación y acciones actuales; el sector de la semilla
-  sólo sirve para estratificar, no rellena valores ausentes de la fuente.
+- Los fundamentales de Yahoo ganan donde existen (últimos 5-7 trimestres) y
+  SEC EDGAR completa los trimestres históricos que Yahoo no publica.
+- PERFIL aporta la clasificación y las acciones actuales; EDGAR puede aportar
+  las acciones del trimestre cuando la empresa las declara en sus 10-Q. El
+  sector de la semilla sólo sirve para estratificar, no rellena valores ausentes.
 - `snapshot_date` identifica la captura de EARNINGS. `linaje.json` documenta además
   el último snapshot usado de cada endpoint/ticker; los consensos se reconstruyen
   desde todas las capturas y la regla temporal.
@@ -203,8 +205,8 @@ fechas, EPS, columnas vacías, volumen, lag mediano de 10–90 días, anuncios p
 al cierre fiscal, OHLC, precios positivos, presencia de SPY, hasta 10 % de empresas
 sin precios y correspondencia exacta del calendario con SPY.
 
-Antes de refinar se comprueba que exista el bronze de SPY (precios y splits) y
-al menos una empresa con resultados, estados contables, OVERVIEW, precios y splits.
+Antes de refinar se comprueba que exista el bronze de SPY (precios) y al menos
+una empresa con resultados, estados contables, EDGAR, PERFIL y precios.
 Si falta esa base, se registra `INGESTA_PENDIENTE` y se omiten refinamiento,
 validación y publicación. No se escriben CSV vacíos ni se pisan los CSV anteriores.
 El informe `state/ingesta_<mode>.json` indica `estado: esperando_datos`, endpoints
@@ -218,9 +220,9 @@ convierte una validación fallida en `skipped`. `validar` no reintenta los mismo
 CSV: un error de calidad falla inmediatamente y conserva su diagnóstico. Los
 reintentos de descarga ante problemas de transporte se mantienen.
 
-`full` exige **al menos 1.001 eventos**; `subset` exige uno para verificar el flujo.
+`fullset` exige **al menos 1.001 eventos**; `subset` exige uno para verificar el flujo.
 El número de eventos real depende de la cobertura, no está garantizado por la
-semilla de 150 tickers. Se registra cuántos eventos quedan fuera del rango temporal
+semilla de 906 tickers. Se registra cuántos eventos quedan fuera del rango temporal
 de precios del benchmark; no se presenta ese dato como cobertura suficiente de
 CAR. La futura capa oro deberá exigir todas las ruedas de cada ventana.
 
@@ -238,11 +240,38 @@ Sin trabajo, el short-circuit omite el resto y termina en verde.
 
 ## Universo y limitaciones
 
-`include/universo/universo.csv` congela 150 símbolos seleccionados manualmente en
-11 sectores, con empresas de distinta escala. El modo `full` usa toda la semilla;
-el modo `subset` selecciona solamente `NVDA`, independientemente del orden del CSV. No pretende representar un índice histórico ni contener tamaños
-verificados en la fecha de cada anuncio. Los símbolos pueden cambiar; respuestas
-no válidas quedan pendientes y deben revisarse en los logs. No hay scraping.
+`include/universo/universo.csv` congela 906 símbolos: el S&P 500 de la semilla
+más los constituyentes del S&P MidCap 400 (los ya presentes no se duplican).
+Los sectores son GICS (11) salvo tres filas históricas marcadas como
+`Technology`. El modo `full` usa toda la semilla; el modo `subset` selecciona
+solamente `NVDA`, independientemente del orden del CSV. No pretende representar
+un índice histórico ni contener tamaños verificados en la fecha de cada anuncio.
+Los símbolos pueden cambiar; respuestas no válidas quedan pendientes y deben
+revisarse en los logs. No hay scraping.
+
+### Cobertura temporal de fundamentales (SEC EDGAR)
+
+Yahoo sólo publica 5-7 trimestres de estados contables por empresa; SEC EDGAR
+cubre los 10-Q/10-K desde la era XBRL (~2009) y alimenta los mismos 9 campos.
+`include/universo/cik.json` mapea ticker -> CIK (snapshot del índice SEC, que
+puede regenerarse desde `company_tickers.json`). Limitaciones a tener presentes:
+
+- Los 10-Q declaran los items de resultado acumulados dentro del año fiscal
+  (YTD): EDGAR los desacumula por trimestre y no fabrica un trimestre cuando
+  queda un hueco mayor a 120 días en la cadena de periodos.
+- Los cierres fiscales de 52/53 semanas (ej. `2026-06-27`) se normalizan a fin
+  de mes para coincidir con `fiscal_quarter_end`.
+- Ante restatements o migración de tags (ASC 606) manda el filing más reciente
+  del periodo; cada valor del bronze guarda tag, form y fecha de filing.
+- Emisores privados extranjeros pueden tener menos 10-Q o filar sólo por año;
+  sus trimestres históricos pueden quedar incompletos.
+- Las financieras siguen sin desglose corriente/no corriente: no completan los 9
+  campos y sus eventos se descartan, igual que hoy con Yahoo.
+- `shares_outstanding` histórico no siempre se declara en los 10-Q: cuando falta,
+  el evento usa las acciones actuales de PERFIL.
+- `EA` no figura en el snapshot del índice SEC (su CIK se agregó a mano en
+  `cik.json`); si una empresa falta del índice, su descarga EDGAR queda pendiente
+  y debe revisarse en los logs.
 
 Para oro: desplazar fundamentales a t-1 y comprobar disponibilidad real; avanzar
 `post-market` a la siguiente rueda; calcular CAR [-1,+1] frente a SPY; construir
@@ -260,7 +289,7 @@ astro dev pytest
 # Entorno local: pruebas offline de ingesta, parsers y flujo; el grafo se
 # prueba también cuando Airflow 3 está instalado (en caso contrario se omite).
 pip install -r requirements-dev.txt
-python -m pytest tests/test_earnings_ingest.py tests/dags/test_earnings_dag.py -q
+python -m pytest tests/test_earnings_ingest.py tests/test_edgar_ingest.py tests/dags/test_earnings_dag.py -q
 ```
 
 Las pruebas usan datos sintéticos identificados como tales y directorios

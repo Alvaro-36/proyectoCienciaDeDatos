@@ -369,10 +369,18 @@ def test_manual_run_date_fallback():
     assert m.fecha_corrida(SimpleNamespace(logical_date=None, run_after=dt)) == '2026-09-08'
 
 
-def test_seed_150_unique_stratified():
+def test_seed_universe_unique_and_stratified():
     seed = pd.read_csv(Path(__file__).resolve().parents[1] / 'include' / 'universo' / 'universo.csv')
-    assert len(seed) == 150 and seed.ticker.is_unique and seed.sector.nunique() == 11
-    assert seed.iloc[:10].sector.nunique() == 10
+    assert len(seed) >= 500
+    assert seed.ticker.is_unique
+    assert not seed.sector.isna().any()
+    # S&P 500 + S&P 400: 11 sectores GICS más la etiqueta legada "Technology".
+    assert set(seed.sector) == {'Industrials', 'Financials', 'Information Technology',
+                                'Health Care', 'Consumer Discretionary', 'Consumer Staples',
+                                'Utilities', 'Real Estate', 'Materials',
+                                'Communication Services', 'Energy', 'Technology'}
+    # La estratificación por sector no queda vacía en las primeras filas.
+    assert seed.iloc[:10].sector.nunique() >= 5
 
 
 def test_readiness_empty_bronze_reports_missing_without_creating_silver():

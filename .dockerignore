@@ -7,6 +7,8 @@ logs/
 airflow.db
 airflow.cfg
 
-include/output/
+include/output/*
+!include/output/
+!include/output/.gitkeep
 .pytest_cache/
 __pycache__/

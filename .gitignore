@@ -20,6 +20,8 @@ airflow.db
 # Datos, credenciales y caches locales del pipeline
 .env.*
 !.env.example
-include/output/
+include/output/*
+!include/output/
+!include/output/.gitkeep
 .pytest_cache/
 *.pyc
