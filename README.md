@@ -82,9 +82,11 @@ User-Agent (10 req/s, sin autenticación). Pautas implementadas:
 - Cada descarga respeta un ritmo global y los errores de conexión/servidor
   permiten reintentos de Airflow. Los archivos ya obtenidos no se descargan otra
   vez.
-- Respuestas no válidas (símbolo desconocido, esquema, sin CIK en `cik.json`) no
-  se almacenan y quedan pendientes; el log indica el rechazo (BRONCE_RECHAZADO,
-  EDGAR_SIN_CIK).
+- Respuestas no válidas (símbolo desconocido, esquema, sin CIK en `cik.json` o
+  HTTP 4xx de SEC EDGAR) no se almacenan y quedan pendientes; el log indica el
+  rechazo (BRONCE_RECHAZADO, EDGAR_SIN_CIK, EDGAR_RECHAZADO_HTTP). Un 4xx es
+  determinístico (CIK sin companyfacts) y no debe fallar el lote: son los 5xx,
+  timeouts y errores de red los que disparan el reintento de Airflow.
 - Para no refrescar siempre las primeras empresas, las descargas sin snapshot
   tienen prioridad; luego se actualiza lo más antiguo.
 - SEC EDGAR es un servicio público: usar un `SEC_USER_AGENT` identificable con

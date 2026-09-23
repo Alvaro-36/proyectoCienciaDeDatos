@@ -113,6 +113,31 @@ def test_edgar_sin_cik_no_hace_red(monkeypatch):
     assert m.edgar_get('ZZZZ') is None  # sin CIK -> rechazo, no transitorio
 
 
+def test_edgar_http_4xx_es_rechazo_no_transitorio(sandbox, monkeypatch):
+    import urllib.error
+    import urllib.request
+
+    def fake_urlopen(request, timeout=20):
+        raise urllib.error.HTTPError(request.full_url, 404, 'Not Found', {}, None)
+
+    monkeypatch.setattr(urllib.request, 'urlopen', fake_urlopen)
+    # 404 = CIK huérfano o sin hechos: None para no fallar el lote en cada corrida.
+    assert m.edgar_get('NVDA') is None
+
+
+def test_edgar_http_5xx_sigue_siendo_transitorio(sandbox, monkeypatch):
+    import urllib.error
+    import urllib.request
+
+    def fake_urlopen(request, timeout=20):
+        raise urllib.error.HTTPError(request.full_url, 503, 'Service Unavailable', {}, None)
+
+    monkeypatch.setattr(urllib.request, 'urlopen', fake_urlopen)
+    # 5xx sí es transitorio: propaga para que el lote reintente conservando bronze.
+    with pytest.raises(urllib.error.HTTPError):
+        m.edgar_get('NVDA')
+
+
 def test_armar_lotes_pocos_items_no_se_parte():
     items = [{'funcion': 'PERFIL', 'ticker': 'NVDA', 'snapshot': '2026-09-23'}]
     lotes = m.armar_lotes(items, workers=8)

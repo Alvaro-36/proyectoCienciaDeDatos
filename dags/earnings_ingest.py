@@ -330,23 +330,33 @@ def parse_edgar_full(ticker, cik, us_gaap):
 def edgar_get(ticker):
     """Descarga companyfacts de SEC EDGAR y lo reduce al payload bronze.
 
-    Sin CIK en el índice -> None (rechazo silencioso, no error de transporte):
-    quedan pendientes para revisar los logs. Errores HTTP/red sí son transitorios.
+    Sin CIK en el índice o HTTP 4xx -> None (rechazo silencioso, no error de
+    transporte): reintentar un 404 no va a servir, sólo ensucia el lote y lo
+    manda a retry para siempre. Los 5xx, timeouts y errores de red sí son
+    transitorios: propagan y el reintento conserva bronze existente.
     """
     cik = leer_cik().get(ticker)
     if not cik:
         log.warning('EDGAR_SIN_CIK ticker=%s', ticker)
         return None
     import gzip
+    import urllib.error
     import urllib.request
     url = f'https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json'
     request = urllib.request.Request(url, headers={'User-Agent': SEC_USER_AGENT,
                                                    'Accept-Encoding': 'gzip, deflate'})
-    with urllib.request.urlopen(request, timeout=20) as response:
-        raw = response.read()
-        if (response.headers.get('Content-Encoding') or '').lower() == 'gzip':
-            raw = gzip.decompress(raw)
-        data = json.loads(raw.decode('utf-8'))
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            raw = response.read()
+            if (response.headers.get('Content-Encoding') or '').lower() == 'gzip':
+                raw = gzip.decompress(raw)
+            data = json.loads(raw.decode('utf-8'))
+    except urllib.error.HTTPError as exc:
+        if 400 <= exc.code < 500:
+            log.warning('EDGAR_RECHAZADO_HTTP ticker=%s cik=%s code=%s url=%s',
+                        ticker, cik, exc.code, url)
+            return None
+        raise
     return parse_edgar_full(ticker, cik, (data.get('facts') or {}).get('us-gaap') or {})
 
 
@@ -502,7 +512,8 @@ def bajar_bronce(lote):
             try:
                 payload = yf_get(funcion, ticker)
             except Exception as exc:  # yfinance envuelve red, parseo y esquema en excepciones propias.
-                log.warning('BRONZE_PENDIENTE endpoint=%s ticker=%s reason=%s', funcion, ticker, type(exc).__name__)
+                log.warning('BRONZE_PENDIENTE endpoint=%s ticker=%s reason=%s code=%s',
+                            funcion, ticker, type(exc).__name__, getattr(exc, 'code', ''))
                 transient += 1
                 continue
             if not es_util(funcion, payload):
