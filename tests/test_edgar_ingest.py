@@ -113,6 +113,54 @@ def test_edgar_sin_cik_no_hace_red(monkeypatch):
     assert m.edgar_get('ZZZZ') is None  # sin CIK -> rechazo, no transitorio
 
 
+def test_armar_lotes_pocos_items_no_se_parte():
+    items = [{'funcion': 'PERFIL', 'ticker': 'NVDA', 'snapshot': '2026-09-23'}]
+    lotes = m.armar_lotes(items, workers=8)
+    assert len(lotes) == 1 and len(lotes[0]['items']) == 1
+
+
+def test_armar_lotes_acota_cada_lote_a_max_items():
+    items = [{'funcion': 'EDGAR', 'ticker': f'X{i:04d}', 'snapshot': '2026-09-23'}
+             for i in range(900)]
+    lotes = m.armar_lotes(items, workers=8)
+    assert all(len(l['items']) <= m.MAX_ITEMS_POR_LOTE for l in lotes)
+    # 900 items / 8 workers -> chunks de 113; el tope de 100 los lleva a 9 de 100.
+    assert len(lotes) == 9 and all(len(l['items']) == 100 for l in lotes)
+    assert sum(len(l['items']) for l in lotes) == 900
+    # Nombres únicos y deterministas para el map_index_template.
+    assert len({l['nombre'] for l in lotes}) == len(lotes)
+
+
+def test_ritmo_segundos_edgar_mas_liviano_que_yahoo():
+    assert m.ritmo_segundos('EDGAR') == m.RITMO_EDGAR_SEGUNDOS
+    assert m.ritmo_segundos('EARNINGS') == m.RITMO_GLOBAL_SEGUNDOS
+    assert m.ritmo_segundos('EDGAR') < m.ritmo_segundos('PRECIOS')
+
+
+def test_bajar_bronce_reporta_progreso_y_reuso_de_bronze(sandbox, caplog, monkeypatch):
+    llamadas = []
+
+    def fake_yf_get(funcion, ticker):
+        llamadas.append(ticker)
+        return {'cik': '0001045810',
+                'periodos': {funcion: {ticker: 1.0}},
+                'fechas': {'min': '2020-04-30', 'max': '2020-04-30'}, 'fuentes': {}}
+
+    monkeypatch.setattr(m, 'yf_get', fake_yf_get)
+    items = [{'funcion': 'EDGAR', 'ticker': 'NVDA', 'snapshot': f'2026-09-2{i}', 'force': False}
+             for i in range(3)]
+    lote = {'nombre': 'lote_001', 'workers': 2, 'items': items}
+    with caplog.at_level('INFO', logger=m.log.name):
+        primera = m.bajar_bronce(lote)
+        segunda = m.bajar_bronce(lote)
+    assert len(primera) == 3 and len(segunda) == 3
+    # La segunda corrida no vuelve a la red: el bronze del día ya está en disco.
+    assert len(llamadas) == 3
+    progresos = [l for l in caplog.text.splitlines() if 'LOTE lote_001' in l and 'progreso' in l]
+    assert len(progresos) >= 2  # arranque y avance visibles en el log
+    assert 'ya_en_bronce=3' in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # Merge en refinar_plata: EDGAR llena los trimestres históricos
 # ---------------------------------------------------------------------------

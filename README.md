@@ -145,6 +145,12 @@ restatements (10-K/A, 10-Q/A) que conviene recoger. La fecha del snapshot es la
 fecha real de captura UTC. La fecha de entrega sale de `logical_date` o
 `run_after` para admitir corridas manuales sin intervalo.
 
+Las descargas se reparten en lotes de hasta 100 ítems (`MAX_ITEMS_POR_LOTE`):
+cada tarea mappeada de `bajar_bronce` termina en minutos y, si un límite de
+tiempo del entorno la corta, el bronze ya guardado persiste y la corrida
+siguiente continúa sin repetir nada. El ritmo entre descargas es por fuente
+(`ritmo_segundos`): SEC EDGAR respira más rápido (hasta 10 req/s) que Yahoo.
+
 ## Plata y decisiones del plan
 
 - `slv_eventos.csv`: clave `(ticker, fiscal_quarter_end)`. Se usa el último snapshot

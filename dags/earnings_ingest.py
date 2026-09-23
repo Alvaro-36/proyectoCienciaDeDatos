@@ -45,9 +45,17 @@ TTL = dict(zip(ENDPOINTS, (7, 30, 30, 30, 1)))
 # más viejo: medido, 14 de 63 tickers, y todos salvo uno son de 2002. Se corta la
 # época entera en vez de arbitrar par por par (cuesta el 3,7% de los eventos).
 PISO_EVENTOS = '2003-01-01'
-# Cada worker espera RITMO_GLOBAL * workers, así el ritmo agregado contra Yahoo
-# queda igual (~4 req/s) sin importar cuántos workers pida la corrida.
+# Cada worker espera RITMO * workers, así el ritmo agregado contra Yahoo queda
+# igual (~4 req/s) sin importar cuántos workers pida la corrida.
 RITMO_GLOBAL_SEGUNDOS = 0.25
+# SEC EDGAR admite hasta 10 req/s con User-Agent identificable: ritmo propio y
+# más liviano; con 8 instancias en paralelo quedan <= ~6,7 req/s agregados.
+RITMO_EDGAR_SEGUNDOS = 0.15
+# Cada lote procesa hasta MAX_ITEMS_POR_LOTE. Acota la duración de cada tarea
+# mappeada (un lote enorme sobrepasa el límite de tiempo de la tarea y muere
+# sin traceback) y hace el progreso incremental: el bronze ya descargado
+# persiste, así que una corrida cortada sigue al día siguiente sin repetir.
+MAX_ITEMS_POR_LOTE = 100
 CATEGORICAS = ['ticker', 'sector', 'industry', 'exchange', 'report_time', 'reported_currency']
 FECHAS = ['fiscal_quarter_end', 'reported_date', 'snapshot_date']
 COLUMNAS_EVENTOS = ['ticker', 'sector', 'industry', 'exchange', 'fiscal_quarter_end',
@@ -334,7 +342,7 @@ def edgar_get(ticker):
     url = f'https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json'
     request = urllib.request.Request(url, headers={'User-Agent': SEC_USER_AGENT,
                                                    'Accept-Encoding': 'gzip, deflate'})
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with urllib.request.urlopen(request, timeout=20) as response:
         raw = response.read()
         if (response.headers.get('Content-Encoding') or '').lower() == 'gzip':
             raw = gzip.decompress(raw)
@@ -413,17 +421,19 @@ def pendientes(mode='fullset', force=False, snapshot=None):
 
 
 def armar_lotes(items, workers=8):
-    """Un lote por worker: la cantidad de lotes ES el paralelismo real.
+    """Un lote por worker hasta MAX_ITEMS_POR_LOTE por lote.
 
     max_active_tis_per_dag es atributo de parseo y no se puede variar por corrida,
     así que pone sólo el techo duro; quien decide cuántas descargas van en paralelo
-    de verdad es cuántos lotes se arman.
+    de verdad es cuántos lotes se arman. El tope por lote acota la duración de cada
+    tarea mappeada: con más items se arman más lotes que quedan en cola, y como el
+    bronze ya descargado persiste, una corrida interrumpida sigue al día siguiente.
     """
     if workers < 1:
         raise ValueError('workers debe ser >= 1.')
     if not items:
         return []
-    size = math.ceil(len(items) / workers)
+    size = max(1, min(math.ceil(len(items) / workers), MAX_ITEMS_POR_LOTE))
     return [{'nombre': f'lote_{i // size + 1:03d}', 'workers': workers,
              'items': items[i:i + size]} for i in range(0, len(items), size)]
 
@@ -458,19 +468,37 @@ def registrar_bronce(path, funcion, ticker, snapshot, raw, payload):
             os.fsync(handle.fileno())
 
 
+def ritmo_segundos(funcion):
+    """Tiempo de espera entre descargas del mismo worker, por fuente."""
+    return RITMO_EDGAR_SEGUNDOS if funcion == 'EDGAR' else RITMO_GLOBAL_SEGUNDOS
+
+
 def bajar_bronce(lote):
+    items = lote['items']
+    log.info('LOTE %s inicio items=%s workers=%s', lote['nombre'], len(items),
+             lote.get('workers', 8))
+    inicio = time.monotonic()
     paths = []
+    descargados = 0
+    ya_habia = 0
     transient = 0
-    for item in lote['items']:
+    rechazados = 0
+    for pos, item in enumerate(items, start=1):
+        if pos % 25 == 1 or pos == len(items):
+            log.info('LOTE %s progreso %s/%s descargados=%s ya_en_bronce=%s '
+                     'pendientes_red=%s rechazados=%s seg=%s',
+                     lote['nombre'], pos - 1, len(items), descargados, ya_habia,
+                     transient, rechazados, round(time.monotonic() - inicio, 1))
         funcion, ticker, snapshot = (item[k] for k in ('funcion', 'ticker', 'snapshot'))
         path = ruta_bronce(funcion, ticker, snapshot)
         with bloqueo(path.with_suffix('.lock')):
             # force vuelve a bajar aunque ya exista; sin force, el archivo del día
             # se respeta y por eso los reintentos del lote salen gratis.
             if path.exists() and not item.get('force'):
+                ya_habia += 1
                 paths.append(str(path))
                 continue
-            time.sleep(RITMO_GLOBAL_SEGUNDOS * lote.get('workers', 8))
+            time.sleep(ritmo_segundos(funcion) * lote.get('workers', 8))
             try:
                 payload = yf_get(funcion, ticker)
             except Exception as exc:  # yfinance envuelve red, parseo y esquema en excepciones propias.
@@ -478,14 +506,21 @@ def bajar_bronce(lote):
                 transient += 1
                 continue
             if not es_util(funcion, payload):
+                rechazados += 1
                 log.warning('BRONZE_RECHAZADO endpoint=%s ticker=%s reason=respuesta_no_util', funcion, ticker)
                 continue
             raw = json.dumps(payload, ensure_ascii=False)
             escribir_atomico(path, raw)
             registrar_bronce(path, funcion, ticker, snapshot, raw, payload)
+            descargados += 1
             paths.append(str(path))
     if transient:
+        log.error('LOTE %s fin con %s descargas con error de transporte; el '
+                  'reintento conserva bronze existente.', lote['nombre'], transient)
         raise RuntimeError(f'{transient} descargas con error de transporte; reintento conserva bronze existente.')
+    log.info('LOTE %s fin items=%s descargados=%s ya_en_bronce=%s rechazados=%s seg=%s',
+             lote['nombre'], len(items), descargados, ya_habia, rechazados,
+             round(time.monotonic() - inicio, 1))
     return paths
 
 
@@ -976,8 +1011,9 @@ else:
          default_args={'owner': 'ciencia-de-datos', 'retries': 2, 'retry_delay': timedelta(minutes=2)},
          tags=['earnings', 'bronze', 'silver'], doc_md=__doc__, params={
              'workers': Param(8, type='integer', minimum=1, maximum=8,
-                              description='Descargas en paralelo. Se arma un lote por worker. '
-                                          'El máximo es 8, el techo fijado en bajar_bronce.'),
+                              description='Paralelismo de descargas: un lote por worker, '
+                                          'acotado a 100 ítems por tarea (queda el techo '
+                                          'fijado en bajar_bronce).'),
              'mode': Param('subset', enum=['subset', 'fullset']),
              'force': Param(False, type='boolean',
                             description='Vuelve a bajar el bronze aunque ya esté en disco.'),
